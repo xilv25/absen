@@ -1,10 +1,9 @@
 {
   "name": "discord-staff-attendance-bot",
   "version": "1.0.0",
+  "description": "Staff attendance & leaderboard bot with Supabase",
   "main": "index.js",
-  "engines": {
-    "node": "18.x"
-  },
+  "engines": { "node": "18.x" },
   "scripts": {
     "start": "node index.js"
   },
