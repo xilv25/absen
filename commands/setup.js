@@ -10,13 +10,12 @@ module.exports = {
     .addSubcommand(s => s.setName('staffrole').setDescription('Set role staff').addRoleOption(o => o.setName('role').setRequired(true)))
     .addSubcommand(s => s.setName('staffchannel').setDescription('Set channel panel staff').addChannelOption(o => o.setName('channel').setRequired(true)))
     .addSubcommand(s => s.setName('leaderboard').setDescription('Set channel leaderboard (boleh sama)').addChannelOption(o => o.setName('channel').setRequired(true)))
-    .addSubcommand(s => s.setName('monitored').setDescription('Set channel yang dipantau (ID dipisah koma)').addStringOption(o => o.setName('channels').setRequired(true)))
+    .addSubcommand(s => s.setName('monitored').setDescription('Set channel yang dipantau (IDs dipisah koma)').addStringOption(o => o.setName('channels').setRequired(true)))
     .addSubcommand(s => s.setName('stagemod').setDescription('Set moderator stage (single mode)').addUserOption(o => o.setName('user').setRequired(true)))
     .addSubcommand(s => s.setName('stage-mode').setDescription('Pilih mode stage').addStringOption(o => o.setName('mode').addChoices(
       { name: 'single', value: 'single' },
       { name: 'role', value: 'role' }
     ).setRequired(true))),
-
   async execute(interaction) {
     const sub = interaction.options.getSubcommand();
     if (sub === 'staffrole') {
