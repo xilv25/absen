@@ -2,19 +2,14 @@
 const supabase = require('./supabase-client');
 
 async function getSetting(key) {
-  const { data, error } = await supabase
-    .from('settings')
-    .select('value')
-    .eq('key', key)
-    .single();
+  const { data, error } = await supabase.from('settings').select('value').eq('key', key).single();
   if (error && error.code !== 'PGRST116') throw error;
   return data ? data.value : null;
 }
 
 async function setSetting(key, value) {
-  await supabase
-    .from('settings')
-    .upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  const { error } = await supabase.from('settings').upsert({ key, value, updated_at: new Date().toISOString() }, { onConflict: 'key' });
+  if (error) throw error;
 }
 
 async function ensureStaff(discordId, displayName = null) {
@@ -38,10 +33,7 @@ async function ensureStaff(discordId, displayName = null) {
     const current = data.display_name;
     const isPlaceholder = !current || /^staff\d*$/i.test(String(current).trim());
     if (isPlaceholder) {
-      await supabase
-        .from('staff')
-        .update({ display_name: displayName, updated_at: new Date().toISOString() })
-        .eq('discord_id', discordId);
+      await supabase.from('staff').update({ display_name: displayName, updated_at: new Date().toISOString() }).eq('discord_id', discordId);
     }
   }
 }
@@ -49,53 +41,36 @@ async function ensureStaff(discordId, displayName = null) {
 async function incrementMessageCount(discordId, channelId) {
   await ensureStaff(discordId);
   try {
+    // try RPC atomic increment (if RPC exists)
     await supabase.rpc('increment_staff_messages', { p_discord_id: discordId });
   } catch {
-    const { data } = await supabase
-      .from('staff')
-      .select('messages_count')
-      .eq('discord_id', discordId)
-      .single();
+    // fallback read-update
+    const { data } = await supabase.from('staff').select('messages_count').eq('discord_id', discordId).single();
     const cur = Number((data && data.messages_count) || 0);
-    await supabase
-      .from('staff')
-      .update({
-        messages_count: cur + 1,
-        updated_at: new Date().toISOString(),
-      })
-      .eq('discord_id', discordId);
+    await supabase.from('staff').update({ messages_count: cur + 1, updated_at: new Date().toISOString() }).eq('discord_id', discordId);
   }
 
-  await supabase
-    .from('message_logs')
-    .insert({ discord_id: discordId, channel_id: channelId })
-    .catch(() => {});
+  // optional log
+  await supabase.from('message_logs').insert({ discord_id: discordId, channel_id: channelId }).catch(() => {});
   await recomputePoints(discordId);
 }
 
 async function recomputePoints(discordId) {
-  const { data } = await supabase
-    .from('staff')
-    .select('messages_count, minutes_on_stage')
-    .eq('discord_id', discordId)
-    .single();
-  if (!data) return;
-  const pts = (data.messages_count / 100) + (data.minutes_on_stage / 30);
-  await supabase
-    .from('staff')
-    .update({ points: pts.toFixed(4), updated_at: new Date().toISOString() })
-    .eq('discord_id', discordId);
+  const { data, error } = await supabase.from('staff').select('messages_count, minutes_on_stage').eq('discord_id', discordId).single();
+  if (error) return;
+  const msgs = Number(data.messages_count || 0);
+  const mins = Number(data.minutes_on_stage || 0);
+  const points = (msgs / 100.0) + (mins / 30.0);
+  await supabase.from('staff').update({ points: Number(points.toFixed(4)), updated_at: new Date().toISOString() }).eq('discord_id', discordId);
 }
 
 async function startStageSession(discordId) {
   await ensureStaff(discordId);
-  await supabase
-    .from('stage_sessions')
-    .insert({ discord_id: discordId, start_at: new Date().toISOString() });
+  await supabase.from('stage_sessions').insert({ discord_id: discordId, start_at: new Date().toISOString() });
 }
 
 async function endStageSession(discordId) {
-  const { data } = await supabase
+  const { data, error } = await supabase
     .from('stage_sessions')
     .select('*')
     .eq('discord_id', discordId)
@@ -103,27 +78,20 @@ async function endStageSession(discordId) {
     .order('start_at', { ascending: false })
     .limit(1)
     .single();
-
   if (!data) return;
-  const mins = Math.floor((Date.now() - new Date(data.start_at)) / 60000);
-  await supabase.from('stage_sessions').update({ end_at: new Date().toISOString() }).eq('id', data.id);
+  const start = new Date(data.start_at);
+  const end = new Date();
+  const minutes = Math.floor((end - start) / 60000);
+  await supabase.from('stage_sessions').update({ end_at: end.toISOString() }).eq('id', data.id);
+
   try {
-    await supabase.rpc('increment_minutes_on_stage', {
-      p_discord_id: discordId,
-      p_minutes: mins,
-    });
+    await supabase.rpc('increment_minutes_on_stage', { p_discord_id: discordId, p_minutes: minutes });
   } catch {
-    const { data: s } = await supabase
-      .from('staff')
-      .select('minutes_on_stage')
-      .eq('discord_id', discordId)
-      .single();
+    const { data: s } = await supabase.from('staff').select('minutes_on_stage').eq('discord_id', discordId).single();
     const cur = Number((s && s.minutes_on_stage) || 0);
-    await supabase
-      .from('staff')
-      .update({ minutes_on_stage: cur + mins, updated_at: new Date().toISOString() })
-      .eq('discord_id', discordId);
+    await supabase.from('staff').update({ minutes_on_stage: cur + minutes, updated_at: new Date().toISOString() }).eq('discord_id', discordId);
   }
+
   await recomputePoints(discordId);
 }
 
@@ -144,5 +112,5 @@ module.exports = {
   recomputePoints,
   startStageSession,
   endStageSession,
-  getLeaderboard,
+  getLeaderboard
 };
