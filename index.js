@@ -1,189 +1,127 @@
 // index.js
 require('dotenv').config();
-const { Client, GatewayIntentBits, Partials, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
-const { createClient } = require('@supabase/supabase-js');
+const fs = require('fs');
+const path = require('path');
+const { Client, GatewayIntentBits, Partials, Collection, REST, Routes, ActionRowBuilder, ButtonBuilder, ButtonStyle, EmbedBuilder } = require('discord.js');
+const supabase = require('./supabase-client');
+const db = require('./db-helpers');
 
-const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_KEY;
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
+if (!DISCORD_TOKEN) throw new Error('DISCORD_TOKEN missing');
 
-if (!SUPABASE_URL || !SUPABASE_KEY || !DISCORD_TOKEN) {
-  console.error('Missing env vars. Set SUPABASE_URL, SUPABASE_KEY, DISCORD_TOKEN.');
-  process.exit(1);
-}
+const client = new Client({
+  intents: [
+    GatewayIntentBits.Guilds,
+    GatewayIntentBits.GuildMessages,
+    GatewayIntentBits.MessageContent,
+    GatewayIntentBits.GuildVoiceStates,
+    GatewayIntentBits.GuildMembers
+  ],
+  partials: [Partials.Channel]
+});
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, { auth: { persistSession: false } });
-
-// Config from env (IDs as string). For multiple channels list comma-separated.
-const STAFF_ROLE_ID = process.env.STAFF_ROLE_ID || ''; // role ID for staff
-const STAGE_MOD_ID = process.env.STAGE_MOD_ID || '';   // user ID of the stage moderator
-const MONITORED_CHANNEL_IDS = (process.env.MONITORED_CHANNEL_IDS || '').split(',').filter(Boolean); // channel IDs to count messages
-const STAFF_CHANNEL_ID = process.env.STAFF_CHANNEL_ID || ''; // where control buttons are posted
-const LEADERBOARD_CHANNEL_ID = process.env.LEADERBOARD_CHANNEL_ID || ''; // where to post/edit leaderboard
-
-// helper: ensure staff row
-async function ensureStaff(discordId, displayName = null) {
-  const { data, error } = await supabase
-    .from('staff')
-    .select('discord_id')
-    .eq('discord_id', discordId)
-    .limit(1);
-
-  if (error) throw error;
-  if (!data || data.length === 0) {
-    const payload = { discord_id: discordId, display_name: displayName || null };
-    await supabase.from('staff').insert(payload);
+// load commands
+client.commands = new Collection();
+const commandsPath = path.join(__dirname, 'commands');
+if (fs.existsSync(commandsPath)) {
+  const files = fs.readdirSync(commandsPath).filter(f => f.endsWith('.js'));
+  for (const f of files) {
+    const cmd = require(path.join(commandsPath, f));
+    client.commands.set(cmd.data.name, cmd);
   }
 }
 
-// increment messages_count by 1 (non-atomic simple version)
-async function incrementMessageCount(discordId, channelId) {
-  await ensureStaff(discordId);
-  // read current
-  const { data: sdata, error: rerr } = await supabase.from('staff').select('messages_count').eq('discord_id', discordId).single();
-  if (rerr) throw rerr;
-  const cur = Number((sdata && sdata.messages_count) || 0);
-  const next = cur + 1;
-  const { error: uerr } = await supabase.from('staff').update({ messages_count: next, updated_at: new Date().toISOString() }).eq('discord_id', discordId);
-  if (uerr) throw uerr;
-
-  // optional log
-  await supabase.from('message_logs').insert({ discord_id: discordId, channel_id: channelId }).catch(() => {});
-  await recomputePoints(discordId);
-}
-
-// recompute points from messages & minutes
-async function recomputePoints(discordId) {
-  const { data, error } = await supabase.from('staff').select('messages_count, minutes_on_stage').eq('discord_id', discordId).single();
-  if (error) throw error;
-  const msgs = Number((data && data.messages_count) || 0);
-  const mins = Number((data && data.minutes_on_stage) || 0);
-  const pointsFromMsgs = msgs / 100.0; // 100 msgs = 1 point
-  const pointsFromStage = mins / 30.0; // 30 min = 1 point
-  const total = Number((pointsFromMsgs + pointsFromStage).toFixed(4));
-  await supabase.from('staff').update({ points: total, updated_at: new Date().toISOString() }).eq('discord_id', discordId);
-}
-
-// stage session handling
-async function startStageSession(discordId) {
-  await ensureStaff(discordId);
-  await supabase.from('stage_sessions').insert({ discord_id: discordId, start_at: new Date().toISOString() });
-}
-
-async function endStageSession(discordId) {
-  // find last open session
-  const { data: sessions, error: sErr } = await supabase
-    .from('stage_sessions')
-    .select('*')
-    .eq('discord_id', discordId)
-    .is('end_at', null)
-    .order('start_at', { ascending: false })
-    .limit(1);
-
-  if (sErr) throw sErr;
-  if (!sessions || sessions.length === 0) return;
-  const sess = sessions[0];
-  const start = new Date(sess.start_at);
-  const end = new Date();
-  const minutes = Math.floor((end - start) / 60000);
-
-  await supabase.from('stage_sessions').update({ end_at: end.toISOString() }).eq('id', sess.id);
-  // add minutes to staff
-  const { data: cur, error: r } = await supabase.from('staff').select('minutes_on_stage').eq('discord_id', discordId).single();
-  if (r) throw r;
-  const curMin = Number((cur && cur.minutes_on_stage) || 0);
-  await supabase.from('staff').update({ minutes_on_stage: curMin + minutes, updated_at: new Date().toISOString() }).eq('discord_id', discordId);
-  await recomputePoints(discordId);
-}
-
-// get leaderboard
-async function getLeaderboard(limit = 13) {
-  const { data, error } = await supabase.from('staff').select('discord_id,display_name,points,messages_count,minutes_on_stage').order('points', { ascending: false }).limit(limit);
-  if (error) throw error;
-  return data || [];
-}
-
-// update or send leaderboard embed in configured channel
-async function postOrUpdateLeaderboard(client) {
-  if (!LEADERBOARD_CHANNEL_ID) return;
+// helper: build and post/update single panel message
+async function postOrUpdatePanel() {
   try {
-    const ch = await client.channels.fetch(LEADERBOARD_CHANNEL_ID);
-    const rows = await getLeaderboard(13);
-    const desc = rows.map((r, i) => {
-      const nameOrId = r.display_name ? `${r.display_name}` : `<@${r.discord_id}>`;
-      const pts = Number(r.points || 0).toFixed(2);
-      return `**${i+1}.** ${nameOrId} — ${pts} pts (msgs:${r.messages_count||0}, mins:${r.minutes_on_stage||0})`;
+    const staffChannel = await db.getSetting('staff_channel');
+    const panelChannelId = staffChannel || await db.getSetting('leaderboard_channel');
+    if (!panelChannelId) return;
+
+    const ch = await client.channels.fetch(panelChannelId).catch(()=>null);
+    if (!ch) return;
+
+    const rows = await db.getLeaderboard(50);
+    const desc = rows.map((r,i) => {
+      const n = r.display_name || `<@${r.discord_id}>`;
+      const pts = Number(r.points||0).toFixed(2);
+      return `**${i+1}.** ${n} — ${pts} pts (msgs:${r.messages_count||0}, mins:${r.minutes_on_stage||0})`;
     }).join('\n') || 'Belum ada data.';
-    const embed = new EmbedBuilder().setTitle('Leaderboard Staff').setDescription(desc).setTimestamp();
 
-    // try find existing bot message in channel with this embed title
-    const fetch = await ch.messages.fetch({ limit: 50 });
-    const botMsg = fetch.find(m => m.author?.id === client.user.id && m.embeds?.[0]?.title === 'Leaderboard Staff');
+    const { data: allStaff } = await supabase.from('staff').select('discord_id, status, display_name').order('display_name', { ascending: true });
 
-    if (botMsg) {
-      await botMsg.edit({ embeds: [embed] });
-    } else {
-      await ch.send({ embeds: [embed] });
-    }
-  } catch (err) {
-    console.error('Failed post/update leaderboard', err.message || err);
-  }
-}
+    const statusText = (allStaff || []).map(s => {
+      const emoji = s.status === 'active' ? '🟢' : (s.status === 'paused' ? '🟠' : '⚪');
+      const name = s.display_name || `<@${s.discord_id}>`;
+      return `${emoji} ${name} — ${s.status}`;
+    }).join('\n') || 'No staff registered.';
 
-// create staff control buttons (post once in STAFF_CHANNEL_ID)
-async function sendStaffControls(client) {
-  if (!STAFF_CHANNEL_ID) return;
-  try {
-    const ch = await client.channels.fetch(STAFF_CHANNEL_ID);
+    const embed = new EmbedBuilder()
+      .setTitle('Panel Absen & Leaderboard Staff')
+      .addFields(
+        { name: 'Leaderboard', value: desc, inline: false },
+        { name: 'Status Staff', value: statusText, inline: false }
+      )
+      .setTimestamp();
+
     const row = new ActionRowBuilder().addComponents(
       new ButtonBuilder().setCustomId('absen').setLabel('Absen').setStyle(ButtonStyle.Success),
       new ButtonBuilder().setCustomId('ijin').setLabel('Ijin').setStyle(ButtonStyle.Secondary),
       new ButtonBuilder().setCustomId('lanjut').setLabel('Lanjut').setStyle(ButtonStyle.Primary),
       new ButtonBuilder().setCustomId('off').setLabel('Off').setStyle(ButtonStyle.Danger),
     );
-    // Send ephemeral instruction and buttons
-    await ch.send({ content: 'Tombol kontrol kehadiran staff — klik sesuai kebutuhan.', components: [row] });
+
+    const msgs = await ch.messages.fetch({ limit: 50 });
+    const botMsg = msgs.find(m => m.author?.id === client.user.id && m.embeds?.[0]?.title === 'Panel Absen & Leaderboard Staff');
+
+    if (botMsg) {
+      await botMsg.edit({ embeds: [embed], components: [row] });
+    } else {
+      await ch.send({ embeds: [embed], components: [row] });
+    }
   } catch (err) {
-    console.error('sendStaffControls err', err.message || err);
+    console.error('postOrUpdatePanel err', err.message || err);
   }
 }
 
-// discord client
-const client = new Client({
-  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.GuildVoiceStates, GatewayIntentBits.GuildMembers],
-  partials: [Partials.Channel]
-});
-
-// interaction (button) handler
+// interactions (buttons + commands)
 client.on('interactionCreate', async (interaction) => {
-  if (!interaction.isButton()) return;
-  const uid = interaction.user.id;
-
-  // only staff can press (check role)
   try {
-    const member = interaction.member;
-    if (!member) return interaction.reply({ content: 'Member data missing.', ephemeral: true });
-    if (STAFF_ROLE_ID && !member.roles.cache.has(STAFF_ROLE_ID)) {
-      return interaction.reply({ content: 'Hanya staff yang bisa mengubah status.', ephemeral: true });
+    // command (slash)
+    if (interaction.isChatInputCommand()) {
+      const cmd = client.commands.get(interaction.commandName);
+      if (!cmd) return;
+      return cmd.execute(interaction);
+    }
+
+    // button
+    if (interaction.isButton()) {
+      const uid = interaction.user.id;
+      // only staff can press
+      const staffRole = await db.getSetting('staff_role');
+      const member = interaction.member;
+      if (staffRole && !member.roles.cache.has(staffRole)) {
+        return interaction.reply({ content: 'Hanya staff yang bisa tekan tombol ini.', ephemeral: true });
+      }
+      await db.ensureStaff(uid, interaction.user.username);
+      if (interaction.customId === 'absen') {
+        await supabase.from('staff').update({ status: 'active', updated_at: new Date().toISOString() }).eq('discord_id', uid);
+        await interaction.reply({ content: '✅ Kamu sekarang absen (active).', ephemeral: true });
+      } else if (interaction.customId === 'ijin') {
+        await supabase.from('staff').update({ status: 'paused', updated_at: new Date().toISOString() }).eq('discord_id', uid);
+        await interaction.reply({ content: '⏸️ Kamu ijin. Counting dihentikan.', ephemeral: true });
+      } else if (interaction.customId === 'lanjut') {
+        await supabase.from('staff').update({ status: 'active', updated_at: new Date().toISOString() }).eq('discord_id', uid);
+        await interaction.reply({ content: '▶️ Counting dilanjutkan.', ephemeral: true });
+      } else if (interaction.customId === 'off') {
+        await supabase.from('staff').update({ status: 'off', updated_at: new Date().toISOString() }).eq('discord_id', uid);
+        await interaction.reply({ content: '⏹️ Kamu off. Counting berhenti.', ephemeral: true });
+      }
+      // update panel after status change
+      setTimeout(() => postOrUpdatePanel().catch(()=>{}), 1000);
     }
   } catch (err) {
-    console.error('role check', err);
-  }
-
-  await ensureStaff(uid, interaction.user.username);
-
-  if (interaction.customId === 'absen') {
-    await supabase.from('staff').update({ status: 'active', updated_at: new Date().toISOString() }).eq('discord_id', uid);
-    await interaction.reply({ content: 'Kamu sekarang **absen (aktif)**. Counting dimulai.', ephemeral: true });
-  } else if (interaction.customId === 'ijin') {
-    await supabase.from('staff').update({ status: 'paused', updated_at: new Date().toISOString() }).eq('discord_id', uid);
-    await interaction.reply({ content: 'Kamu **ijin**. Counting dihentikan sementara.', ephemeral: true });
-  } else if (interaction.customId === 'lanjut') {
-    await supabase.from('staff').update({ status: 'active', updated_at: new Date().toISOString() }).eq('discord_id', uid);
-    await interaction.reply({ content: 'Counting dilanjutkan.', ephemeral: true });
-  } else if (interaction.customId === 'off') {
-    await supabase.from('staff').update({ status: 'off', updated_at: new Date().toISOString() }).eq('discord_id', uid);
-    await interaction.reply({ content: 'Kamu **off**. Counting berhenti.', ephemeral: true });
+    console.error('interactionCreate err', err);
   }
 });
 
@@ -191,58 +129,74 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (msg) => {
   try {
     if (msg.author?.bot) return;
-    if (!MONITORED_CHANNEL_IDS.includes(msg.channel.id)) return;
+    // get monitored channels from settings
+    const monitored = (await db.getSetting('monitored_channels')) || process.env.MONITORED_CHANNEL_IDS || '';
+    const monitoredIds = monitored.split(',').map(s=>s.trim()).filter(Boolean);
+    if (!monitoredIds.includes(msg.channel.id)) return;
     const member = msg.member;
     if (!member) return;
-    if (STAFF_ROLE_ID && !member.roles.cache.has(STAFF_ROLE_ID)) return;
+
+    const staffRole = await db.getSetting('staff_role');
+    if (staffRole && !member.roles.cache.has(staffRole)) return;
+
     // check staff status
-    const { data: row, error: e } = await supabase.from('staff').select('status').eq('discord_id', member.id).single();
-    if (e && e.code !== 'PGRST116') { /* ignore if no row */ }
+    const { data: row } = await supabase.from('staff').select('status').eq('discord_id', member.id).single();
     const status = (row && row.status) || 'off';
     if (status !== 'active') return;
-    await incrementMessageCount(member.id, msg.channel.id);
+
+    await db.incrementMessageCount(member.id, msg.channel.id);
+    // update panel occasionally (debounce handled by interval)
   } catch (err) {
-    console.error('messageCreate handler error', err.message || err);
+    console.error('messageCreate err', err);
   }
 });
 
-// voiceStateUpdate -> track stage mod join/leave
+// voiceStateUpdate -> stage handling (single or role mode)
 client.on('voiceStateUpdate', async (oldState, newState) => {
   try {
-    const oldCh = oldState.channel;
     const newCh = newState.channel;
-    const userId = (newState.member || oldState.member)?.id;
+    const oldCh = oldState.channel;
+    const user = (newState.member || oldState.member);
+    if (!user) return;
+    const stageMode = (await db.getSetting('stage_mode')) || 'single';
 
-    if (!STAGE_MOD_ID) return;
-
-    // joined stage
-    if (newCh && userId === STAGE_MOD_ID && newCh?.type === 13 /* GUILD_STAGE_VOICE */) {
-      await startStageSession(STAGE_MOD_ID);
-    }
-
-    // left stage
-    if (oldCh && userId === STAGE_MOD_ID && oldCh?.type === 13 && (!newCh || newCh.id !== oldCh.id)) {
-      await endStageSession(STAGE_MOD_ID);
+    if (stageMode === 'single') {
+      const modId = await db.getSetting('stage_mod');
+      if (!modId) return;
+      if (newCh && user.id === modId && newCh.type === 13) await db.startStageSession(modId);
+      if (oldCh && user.id === modId && oldCh.type === 13 && (!newCh || newCh.id !== oldCh.id)) await db.endStageSession(modId);
+    } else { // role mode
+      const staffRole = await db.getSetting('staff_role');
+      if (!staffRole) return;
+      // ensure member object has roles
+      const hasRole = user.roles?.cache?.has ? user.roles.cache.has(staffRole) : false;
+      if (!hasRole) return;
+      if (newCh && newCh.type === 13) await db.startStageSession(user.id);
+      if (oldCh && oldCh.type === 13 && (!newCh || newCh.id !== oldCh.id)) await db.endStageSession(user.id);
     }
   } catch (err) {
-    console.error('voiceStateUpdate error', err.message || err);
+    console.error('voiceStateUpdate err', err);
   }
 });
 
 client.once('ready', async () => {
-  console.log(`Logged in as ${client.user.tag}`);
-  // ensure tables exist? assume created in Supabase already.
-  // send control panel if desired (uncomment to send automatically)
-  // await sendStaffControls(client);
+  console.log('Logged in as', client.user.tag);
 
-  // initial leaderboard post/update
-  await postOrUpdateLeaderboard(client);
+  // register slash commands globally (or change to guild-specific if testing)
+  try {
+    const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+    const data = client.commands.map(c => c.data.toJSON());
+    await rest.put(Routes.applicationCommands(client.user.id), { body: data });
+    console.log('✅ Slash commands registered');
+  } catch (err) {
+    console.error('Failed register commands', err);
+  }
 
-  // update leaderboard every 30s
-  setInterval(() => postOrUpdateLeaderboard(client).catch(console.error), 30_000);
+  // initial panel post & update loop
+  await postOrUpdatePanel();
+  setInterval(() => postOrUpdatePanel().catch(()=>{}), 30_000);
 });
 
-// login
 client.login(DISCORD_TOKEN).catch(err => {
   console.error('login failed', err);
   process.exit(1);
