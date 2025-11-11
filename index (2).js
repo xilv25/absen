@@ -1,4 +1,3 @@
-// index.js — FINAL (emoji status) 
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
